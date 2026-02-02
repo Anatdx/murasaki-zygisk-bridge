@@ -1,0 +1,7 @@
+id=murasaki_bridge
+name=Murasaki Bridge (Zygisk)
+version=0.1.0
+versionCode=1
+author=YukiSU
+description=system_server bridge for Murasaki/Shizuku (MRSK), feeds binder on-demand to declared & authorized apps.
+

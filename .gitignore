@@ -1,0 +1,6 @@
+userspace/zygisk_murasaki_bridge/build-*/
+magisk-module/zygisk/*.so
+murasaki_bridge_zygisk.zip
+.DS_Store
+build-test/
+.vscode/
