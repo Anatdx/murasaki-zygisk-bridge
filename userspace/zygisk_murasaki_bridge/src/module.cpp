@@ -22,8 +22,19 @@ public:
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs* args) override {
         (void)args;
-        if (env_) {
-            murasaki::bridge::install(env_);
+        if (!api_ || !env_) {
+            return;
+        }
+
+        // Hook android.os.Binder#execTransact(IJJI)Z in system_server only.
+        // This avoids risky JNI table patching and is much more stable.
+        JNINativeMethod m[] = {
+            {"execTransact", "(IJJI)Z", (void*)murasaki::bridge::execTransact},
+        };
+        api_->hookJniNativeMethods(env_, "android/os/Binder", m, 1);
+        if (m[0].fnPtr) {
+            murasaki::bridge::setOriginalExecTransact(
+                (murasaki::bridge::ExecTransact_t)m[0].fnPtr);
         }
     }
 

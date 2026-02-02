@@ -1,7 +1,6 @@
 #include "bridge.hpp"
 
 #include <android/log.h>
-#include <dlfcn.h>
 #include <sys/types.h>
 
 #include <cstdarg>
@@ -29,8 +28,7 @@ static constexpr const char* SHIZUKU_API_PERMISSION_PREFIX = "moe.shizuku.manage
 static constexpr const char* SHIZUKU_V3_META = "moe.shizuku.client.V3_SUPPORT";
 static constexpr const char* MURASAKI_META = "io.murasaki.client.SUPPORT";
 
-// Cached JNI items
-static jmethodID g_execTransact_mid = nullptr;
+static ExecTransact_t g_orig_execTransact = nullptr;
 
 static jclass g_cls_Binder = nullptr;
 static jmethodID g_mid_getCallingUid = nullptr;
@@ -83,18 +81,6 @@ static jmethodID g_mid_Bundle_getBoolean = nullptr;
 static jclass g_cls_String = nullptr;
 static jmethodID g_mid_String_startsWith = nullptr;
 
-// Hooking JNIEnv table
-using CallBooleanMethodV_t = jboolean (*)(JNIEnv*, jobject, jmethodID, va_list);
-using GetEnv_t = jint (*)(JavaVM*, void**, jint);
-
-static const JNINativeInterface* g_old_jni = nullptr;
-static JNINativeInterface* g_new_jni = nullptr;
-static const JNIInvokeInterface* g_old_vm = nullptr;
-static JNIInvokeInterface* g_new_vm = nullptr;
-
-static CallBooleanMethodV_t g_old_CallBooleanMethodV = nullptr;
-static GetEnv_t g_old_GetEnv = nullptr;
-
 static inline void logd(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -106,13 +92,6 @@ static inline void logw(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     __android_log_vprint(ANDROID_LOG_WARN, LOG_TAG, fmt, ap);
-    va_end(ap);
-}
-
-static inline void loge(const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    __android_log_vprint(ANDROID_LOG_ERROR, LOG_TAG, fmt, ap);
     va_end(ap);
 }
 
@@ -413,9 +392,7 @@ static bool murasaki_is_uid_allowed(JNIEnv* env, jobject murasaki_binder, jint u
     return allowed;
 }
 
-static bool handle_bridge(JNIEnv* env, jobject binder_obj, jint code, jlong dataObj, jlong replyObj, jint flags) {
-    (void)binder_obj;
-    (void)flags;
+static bool handle_bridge(JNIEnv* env, jint code, jlong dataObj, jlong replyObj) {
     if (code != TRANSACTION_MRSK) {
         return false;
     }
@@ -538,84 +515,28 @@ static bool handle_bridge(JNIEnv* env, jobject binder_obj, jint code, jlong data
     return true;
 }
 
-static jboolean new_CallBooleanMethodV(JNIEnv* env, jobject obj, jmethodID methodId, va_list args) {
-    if (methodId == g_execTransact_mid) {
-        va_list copy;
-        va_copy(copy, args);
-        jint code = va_arg(copy, jint);
-        jlong dataObj = va_arg(copy, jlong);
-        jlong replyObj = va_arg(copy, jlong);
-        jint flags = va_arg(copy, jint);
-        va_end(copy);
+void setOriginalExecTransact(ExecTransact_t orig) {
+    g_orig_execTransact = orig;
+}
 
-        if (handle_bridge(env, obj, code, dataObj, replyObj, flags)) {
+jboolean execTransact(JNIEnv* env, jobject thiz, jint code, jlong dataObj, jlong replyObj, jint flags) {
+    (void)flags;
+
+    // Handle only our bridge transaction. Everything else falls back to original.
+    if (code == TRANSACTION_MRSK) {
+        bool consumed = handle_bridge(env, code, dataObj, replyObj);
+        if (consumed) {
             return JNI_TRUE;
         }
-    }
-    return g_old_CallBooleanMethodV(env, obj, methodId, args);
-}
-
-static jint new_GetEnv(JavaVM* vm, void** env, jint version) {
-    jint res = g_old_GetEnv(vm, env, version);
-    if (res == JNI_OK && env && *env && g_new_jni) {
-        ((JNIEnv*)*env)->functions = g_new_jni;
-    }
-    return res;
-}
-
-static bool install_jni_hook(JNIEnv* env) {
-    JavaVM* vm = nullptr;
-    if (env->GetJavaVM(&vm) != JNI_OK || !vm) {
-        return false;
+        // For MRSK not handled, return false to match Sui behavior (client will fall back).
+        return JNI_FALSE;
     }
 
-    // Find Binder.execTransact method id (instance)
-    jclass binderCls = env->FindClass("android/os/Binder");
-    if (!binderCls) {
-        clear_exc(env);
-        return false;
+    if (g_orig_execTransact) {
+        return g_orig_execTransact(env, thiz, code, dataObj, replyObj, flags);
     }
-    g_execTransact_mid = env->GetMethodID(binderCls, "execTransact", "(IJJI)Z");
-    env->DeleteLocalRef(binderCls);
-    if (!g_execTransact_mid) {
-        clear_exc(env);
-        return false;
-    }
-
-    g_old_jni = env->functions;
-    g_old_CallBooleanMethodV = env->functions->CallBooleanMethodV;
-    if (!g_old_CallBooleanMethodV) {
-        return false;
-    }
-
-    // Clone JNIEnv function table
-    g_new_jni = new JNINativeInterface();
-    std::memcpy(g_new_jni, env->functions, sizeof(JNINativeInterface));
-    g_new_jni->CallBooleanMethodV = new_CallBooleanMethodV;
-
-    // Patch JavaVM GetEnv so new threads also get hooked table
-    g_old_vm = vm->functions;
-    g_old_GetEnv = vm->functions->GetEnv;
-    g_new_vm = new JNIInvokeInterface();
-    std::memcpy(g_new_vm, vm->functions, sizeof(JNIInvokeInterface));
-    g_new_vm->GetEnv = new_GetEnv;
-
-    vm->functions = g_new_vm;
-    env->functions = g_new_jni;
-    return true;
-}
-
-bool install(JNIEnv* env) {
-    if (!ensure_cache(env)) {
-        loge("cache init failed");
-        return false;
-    }
-    if (!install_jni_hook(env)) {
-        loge("install_jni_hook failed");
-        return false;
-    }
-    logd("installed (system_server)");
-    return true;
+    // Should never happen, but fail open by letting Binder treat it as unhandled.
+    return JNI_FALSE;
 }
 
 }  // namespace murasaki::bridge
