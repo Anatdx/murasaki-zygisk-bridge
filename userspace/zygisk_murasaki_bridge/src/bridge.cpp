@@ -2,8 +2,11 @@
 
 #include <android/log.h>
 #include <sys/types.h>
+#include <unistd.h>
 
+#include <cstdio>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -27,6 +30,10 @@ static constexpr jint MURASAKI_TX_isUidGrantedRoot = 11;
 static constexpr const char* SHIZUKU_API_PERMISSION_PREFIX = "moe.shizuku.manager.permission.API";
 static constexpr const char* SHIZUKU_V3_META = "moe.shizuku.client.V3_SUPPORT";
 static constexpr const char* MURASAKI_META = "io.murasaki.client.SUPPORT";
+
+// Rei 优先：桥接读取白名单时先试 Rei 目录，兼容 YukiSU 旧路径
+static constexpr const char* ALLOWLIST_REI = "/data/adb/rei/.murasaki_allowlist";
+static constexpr const char* ALLOWLIST_KSU = "/data/adb/ksu/.murasaki_allowlist";
 
 static ExecTransact_t g_orig_execTransact = nullptr;
 
@@ -99,6 +106,27 @@ static void clear_exc(JNIEnv* env) {
     if (env->ExceptionCheck()) {
         env->ExceptionClear();
     }
+}
+
+// Rei 优先：若任一白名单文件存在且可读，则 calling_uid 必须在其中；无文件或不可读时返回 true（交给 daemon）
+static bool allowlist_file_contains_uid(jint calling_uid) {
+    for (const char* path : {ALLOWLIST_REI, ALLOWLIST_KSU}) {
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        bool found = false;
+        char line[64];
+        while (fgets(line, sizeof(line), f)) {
+            int uid = -1;
+            if (sscanf(line, "%d", &uid) == 1 && uid == static_cast<int>(calling_uid)) {
+                found = true;
+                break;
+            }
+        }
+        fclose(f);
+        if (found) return true;
+        return false;  // 该文件存在但 uid 不在列表中
+    }
+    return true;  // 无文件或不可读时交给 daemon
 }
 
 static bool ensure_cache(JNIEnv* env) {
@@ -446,9 +474,27 @@ static bool handle_bridge(JNIEnv* env, jint code, jlong dataObj, jlong replyObj)
         return false;
     }
 
-    jobject murasaki = sm_get_service(env, SERVICE_MURASAKI);
+    // Rei 优先：白名单文件存在时，若 UID 不在 /data/adb/rei/.murasaki_allowlist（或 ksu 路径）则直接拒绝
+    if (!allowlist_file_contains_uid(callingUid)) {
+        env->CallVoidMethod(data, g_mid_Parcel_setDataPosition, 0);
+        if (reply) env->CallVoidMethod(reply, g_mid_Parcel_setDataPosition, 0);
+        env->CallVoidMethod(data, g_mid_Parcel_recycle);
+        if (reply) env->CallVoidMethod(reply, g_mid_Parcel_recycle);
+        env->DeleteLocalRef(data);
+        if (reply) env->DeleteLocalRef(reply);
+        return false;
+    }
+
+    // Daemon may start slightly after system_server; retry a few times.
+    jobject murasaki = nullptr;
+    for (int attempt = 0; attempt <= 3 && !murasaki; ++attempt) {
+        if (attempt > 0) {
+            usleep(250000);  // 250ms
+        }
+        murasaki = sm_get_service(env, SERVICE_MURASAKI);
+    }
     if (!murasaki) {
-        logw("murasaki binder not found in ServiceManager");
+        logw("murasaki binder not found in ServiceManager. Ensure reid/apd 'services' runs at boot (e.g. module service.sh) and /data/adb/rei/.murasaki_allowlist exists.");
         env->CallVoidMethod(data, g_mid_Parcel_setDataPosition, 0);
         if (reply) env->CallVoidMethod(reply, g_mid_Parcel_setDataPosition, 0);
         env->CallVoidMethod(data, g_mid_Parcel_recycle);
