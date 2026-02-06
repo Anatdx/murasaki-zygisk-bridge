@@ -2,6 +2,7 @@
 
 #include <android/log.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -48,6 +49,7 @@ static jmethodID g_mid_Parcel_recycle = nullptr;
 static jmethodID g_mid_Parcel_setDataPosition = nullptr;
 static jmethodID g_mid_Parcel_enforceInterface = nullptr;
 static jmethodID g_mid_Parcel_readInt = nullptr;
+static jmethodID g_mid_Parcel_readByte = nullptr;  // for AIDL boolean (writeBool -> byte 0/1)
 static jmethodID g_mid_Parcel_readString = nullptr;
 static jmethodID g_mid_Parcel_writeInterfaceToken = nullptr;
 static jmethodID g_mid_Parcel_writeInt = nullptr;
@@ -87,6 +89,24 @@ static jmethodID g_mid_Bundle_getBoolean = nullptr;
 
 static jclass g_cls_String = nullptr;
 static jmethodID g_mid_String_startsWith = nullptr;
+
+// Launch Rei AuthorizeActivity (Murasaki auth dialog)
+static jclass g_cls_Intent = nullptr;
+static jmethodID g_mid_Intent_init = nullptr;
+static jmethodID g_mid_Intent_setClassName = nullptr;
+static jmethodID g_mid_Intent_putExtra_SS = nullptr;
+static jmethodID g_mid_Intent_putExtra_SI = nullptr;
+static jmethodID g_mid_Intent_addFlags = nullptr;
+static jmethodID g_mid_Context_startActivity = nullptr;
+static constexpr jint FLAG_ACTIVITY_NEW_TASK = 0x10000000;
+
+// Sync with Rei AuthRequest / AuthorizeActivity
+static constexpr const char* REI_PACKAGE = "com.anatdx.rei";
+static constexpr const char* REI_AUTH_ACTIVITY = "com.anatdx.rei.ui.auth.AuthorizeActivity";
+static constexpr const char* EXTRA_PACKAGE = "rei.extra.PACKAGE";
+static constexpr const char* EXTRA_UID = "rei.extra.UID";
+static constexpr const char* EXTRA_SOURCE = "rei.extra.SOURCE";
+static constexpr const char* SOURCE_MURASAKI = "murasaki";
 
 static inline void logd(const char* fmt, ...) {
     va_list ap;
@@ -156,6 +176,7 @@ static bool ensure_cache(JNIEnv* env) {
     g_mid_Parcel_setDataPosition = env->GetMethodID(g_cls_Parcel, "setDataPosition", "(I)V");
     g_mid_Parcel_enforceInterface = env->GetMethodID(g_cls_Parcel, "enforceInterface", "(Ljava/lang/String;)V");
     g_mid_Parcel_readInt = env->GetMethodID(g_cls_Parcel, "readInt", "()I");
+    g_mid_Parcel_readByte = env->GetMethodID(g_cls_Parcel, "readByte", "()B");
     g_mid_Parcel_readString = env->GetMethodID(g_cls_Parcel, "readString", "()Ljava/lang/String;");
     g_mid_Parcel_writeInterfaceToken = env->GetMethodID(g_cls_Parcel, "writeInterfaceToken", "(Ljava/lang/String;)V");
     g_mid_Parcel_writeInt = env->GetMethodID(g_cls_Parcel, "writeInt", "(I)V");
@@ -219,8 +240,104 @@ static bool ensure_cache(JNIEnv* env) {
     if (!g_cls_String) return false;
     g_mid_String_startsWith = env->GetMethodID(g_cls_String, "startsWith", "(Ljava/lang/String;)Z");
 
+    // android.content.Intent (for launching Rei AuthorizeActivity)
+    g_cls_Intent = make_global(env->FindClass("android/content/Intent"));
+    if (!g_cls_Intent) return false;
+    g_mid_Intent_init = env->GetMethodID(g_cls_Intent, "<init>", "()V");
+    g_mid_Intent_setClassName =
+        env->GetMethodID(g_cls_Intent, "setClassName", "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;");
+    g_mid_Intent_putExtra_SS =
+        env->GetMethodID(g_cls_Intent, "putExtra", "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;");
+    g_mid_Intent_putExtra_SI = env->GetMethodID(g_cls_Intent, "putExtra", "(Ljava/lang/String;I)Landroid/content/Intent;");
+    g_mid_Intent_addFlags = env->GetMethodID(g_cls_Intent, "addFlags", "(I)Landroid/content/Intent;");
+    g_mid_Context_startActivity = env->GetMethodID(g_cls_Context, "startActivity", "(Landroid/content/Intent;)V");
+
     clear_exc(env);
     return true;
+}
+
+// Returns first package name for uid, or empty string. Caller must DeleteLocalRef the jstring if non-null returned as jobject.
+static std::string get_first_package_for_uid(JNIEnv* env, jint uid) {
+    jobject at = env->CallStaticObjectMethod(g_cls_ActivityThread, g_mid_AT_currentActivityThread);
+    if (env->ExceptionCheck() || !at) {
+        clear_exc(env);
+        return {};
+    }
+    jobject ctx = env->CallObjectMethod(at, g_mid_AT_getSystemContext);
+    env->DeleteLocalRef(at);
+    if (env->ExceptionCheck() || !ctx) {
+        clear_exc(env);
+        return {};
+    }
+    jobject pm = env->CallObjectMethod(ctx, g_mid_Context_getPackageManager);
+    env->DeleteLocalRef(ctx);
+    if (env->ExceptionCheck() || !pm) {
+        clear_exc(env);
+        return {};
+    }
+    jobjectArray pkgs = (jobjectArray) env->CallObjectMethod(pm, g_mid_PM_getPackagesForUid, uid);
+    env->DeleteLocalRef(pm);
+    if (env->ExceptionCheck() || !pkgs) {
+        clear_exc(env);
+        return {};
+    }
+    jint n = env->GetArrayLength(pkgs);
+    if (n <= 0) {
+        env->DeleteLocalRef(pkgs);
+        return {};
+    }
+    jstring first = (jstring) env->GetObjectArrayElement(pkgs, 0);
+    env->DeleteLocalRef(pkgs);
+    if (!first) return {};
+    const char* utf = env->GetStringUTFChars(first, nullptr);
+    std::string pkg = utf ? utf : "";
+    if (utf) env->ReleaseStringUTFChars(first, utf);
+    env->DeleteLocalRef(first);
+    return pkg;
+}
+
+// Launch Rei's AuthorizeActivity for Murasaki grant. System context can start exported=false activity.
+static void launch_rei_murasaki_auth(JNIEnv* env, jint uid, const std::string& packageName) {
+    if (packageName.empty() || !g_mid_Context_startActivity || !g_mid_Intent_setClassName) return;
+    jobject at = env->CallStaticObjectMethod(g_cls_ActivityThread, g_mid_AT_currentActivityThread);
+    if (env->ExceptionCheck() || !at) {
+        clear_exc(env);
+        return;
+    }
+    jobject ctx = env->CallObjectMethod(at, g_mid_AT_getSystemContext);
+    env->DeleteLocalRef(at);
+    if (env->ExceptionCheck() || !ctx) {
+        clear_exc(env);
+        return;
+    }
+    jobject intent = env->NewObject(g_cls_Intent, g_mid_Intent_init);
+    if (env->ExceptionCheck() || !intent) {
+        clear_exc(env);
+        env->DeleteLocalRef(ctx);
+        return;
+    }
+    jstring jpkg = env->NewStringUTF(packageName.c_str());
+    jstring jrei = env->NewStringUTF(REI_PACKAGE);
+    jstring jactivity = env->NewStringUTF(REI_AUTH_ACTIVITY);
+    jstring jsource = env->NewStringUTF(SOURCE_MURASAKI);
+    env->CallObjectMethod(intent, g_mid_Intent_setClassName, jrei, jactivity);
+    env->CallObjectMethod(intent, g_mid_Intent_putExtra_SS, env->NewStringUTF(EXTRA_PACKAGE), jpkg);
+    env->CallObjectMethod(intent, g_mid_Intent_putExtra_SI, env->NewStringUTF(EXTRA_UID), uid);
+    env->CallObjectMethod(intent, g_mid_Intent_putExtra_SS, env->NewStringUTF(EXTRA_SOURCE), jsource);
+    env->CallObjectMethod(intent, g_mid_Intent_addFlags, FLAG_ACTIVITY_NEW_TASK);
+    env->CallVoidMethod(ctx, g_mid_Context_startActivity, intent);
+    if (env->ExceptionCheck()) {
+        logw("launch_rei_murasaki_auth startActivity failed");
+        clear_exc(env);
+    } else {
+        logd("launch_rei_murasaki_auth: uid=%d pkg=%s", uid, packageName.c_str());
+    }
+    env->DeleteLocalRef(jpkg);
+    env->DeleteLocalRef(jrei);
+    env->DeleteLocalRef(jactivity);
+    env->DeleteLocalRef(jsource);
+    env->DeleteLocalRef(intent);
+    env->DeleteLocalRef(ctx);
 }
 
 static jobject parcel_from_ptr(JNIEnv* env, jlong ptr) {
@@ -404,11 +521,19 @@ static bool murasaki_is_uid_allowed(JNIEnv* env, jobject murasaki_binder, jint u
         if (env->ExceptionCheck()) {
             clear_exc(env);
         } else {
-            jint v = env->CallIntMethod(reply, g_mid_Parcel_readInt);
-            if (env->ExceptionCheck()) {
-                clear_exc(env);
-            } else {
-                allowed = (v != 0);
+            // Rei uses AParcel_writeBool (1 byte)
+            if (g_mid_Parcel_readByte) {
+                jbyte b = env->CallByteMethod(reply, g_mid_Parcel_readByte);
+                if (!env->ExceptionCheck())
+                    allowed = (b != 0);
+                else
+                    clear_exc(env);
+            } else if (g_mid_Parcel_readInt) {
+                jint v = env->CallIntMethod(reply, g_mid_Parcel_readInt);
+                if (!env->ExceptionCheck())
+                    allowed = (v != 0);
+                else
+                    clear_exc(env);
             }
         }
     }
@@ -435,7 +560,7 @@ static bool handle_bridge(JNIEnv* env, jint code, jlong dataObj, jlong replyObj)
         return false;
     }
 
-    // enforce interface
+    // Enforce descriptor (Sui: data.enforceInterface(DESCRIPTOR))
     jstring ams_desc = env->NewStringUTF(AMS_DESCRIPTOR);
     env->CallVoidMethod(data, g_mid_Parcel_enforceInterface, ams_desc);
     env->DeleteLocalRef(ams_desc);
@@ -455,7 +580,7 @@ static bool handle_bridge(JNIEnv* env, jint code, jlong dataObj, jlong replyObj)
     }
 
     jint callingUid = env->CallStaticIntMethod(g_cls_Binder, g_mid_getCallingUid);
-    (void)env->CallStaticIntMethod(g_cls_Binder, g_mid_getCallingPid);
+    (void) env->CallStaticIntMethod(g_cls_Binder, g_mid_getCallingPid);
     if (env->ExceptionCheck()) {
         clear_exc(env);
         env->DeleteLocalRef(data);
@@ -463,54 +588,48 @@ static bool handle_bridge(JNIEnv* env, jint code, jlong dataObj, jlong replyObj)
         return false;
     }
 
-    // Fail closed unless declared
+    // Fail closed unless declared (Sui: isDeclaredClient)
     if (!is_declared_client(env, callingUid)) {
-        env->CallVoidMethod(data, g_mid_Parcel_setDataPosition, 0);
-        if (reply) env->CallVoidMethod(reply, g_mid_Parcel_setDataPosition, 0);
-        env->CallVoidMethod(data, g_mid_Parcel_recycle);
-        if (reply) env->CallVoidMethod(reply, g_mid_Parcel_recycle);
+        logd("bridge denied: uid=%d not declared", callingUid);
         env->DeleteLocalRef(data);
         if (reply) env->DeleteLocalRef(reply);
         return false;
     }
 
-    // Rei 优先：白名单文件存在时，若 UID 不在 /data/adb/rei/.murasaki_allowlist（或 ksu 路径）则直接拒绝
+    // Rei: if allowlist file exists and uid not in it, show Rei auth dialog instead of denying
     if (!allowlist_file_contains_uid(callingUid)) {
-        env->CallVoidMethod(data, g_mid_Parcel_setDataPosition, 0);
-        if (reply) env->CallVoidMethod(reply, g_mid_Parcel_setDataPosition, 0);
-        env->CallVoidMethod(data, g_mid_Parcel_recycle);
-        if (reply) env->CallVoidMethod(reply, g_mid_Parcel_recycle);
+        std::string pkg = get_first_package_for_uid(env, callingUid);
+        if (!pkg.empty()) {
+            launch_rei_murasaki_auth(env, callingUid, pkg);
+        } else {
+            logd("bridge: uid=%d not in allowlist, no package name to show dialog", callingUid);
+        }
         env->DeleteLocalRef(data);
         if (reply) env->DeleteLocalRef(reply);
         return false;
     }
 
-    // Daemon may start slightly after system_server; retry a few times.
+    // Daemon may start after system_server; retry like Sui readiness
     jobject murasaki = nullptr;
-    for (int attempt = 0; attempt <= 3 && !murasaki; ++attempt) {
-        if (attempt > 0) {
-            usleep(250000);  // 250ms
-        }
+    static const int kMaxAttempts = 5;
+    static const useconds_t kDelayUs = 300000;  // 300ms
+    for (int attempt = 0; attempt < kMaxAttempts && !murasaki; ++attempt) {
+        if (attempt > 0)
+            usleep(kDelayUs);
         murasaki = sm_get_service(env, SERVICE_MURASAKI);
     }
     if (!murasaki) {
-        logw("murasaki binder not found in ServiceManager. Ensure reid/apd 'services' runs at boot (e.g. module service.sh) and /data/adb/rei/.murasaki_allowlist exists.");
-        env->CallVoidMethod(data, g_mid_Parcel_setDataPosition, 0);
-        if (reply) env->CallVoidMethod(reply, g_mid_Parcel_setDataPosition, 0);
-        env->CallVoidMethod(data, g_mid_Parcel_recycle);
-        if (reply) env->CallVoidMethod(reply, g_mid_Parcel_recycle);
+        logw("murasaki binder not in ServiceManager (reid/apd services not ready?)");
         env->DeleteLocalRef(data);
         if (reply) env->DeleteLocalRef(reply);
         return false;
     }
 
-    // Ask ksud whether this uid is allowed (manager-controlled)
-    if (!murasaki_is_uid_allowed(env, murasaki, callingUid)) {
+    // Rei: daemon allowlist check (isUidGrantedRoot). If call fails, still pass binder (Sui doesn't check)
+    bool uidAllowed = murasaki_is_uid_allowed(env, murasaki, callingUid);
+    if (!uidAllowed) {
         env->DeleteLocalRef(murasaki);
-        env->CallVoidMethod(data, g_mid_Parcel_setDataPosition, 0);
-        if (reply) env->CallVoidMethod(reply, g_mid_Parcel_setDataPosition, 0);
-        env->CallVoidMethod(data, g_mid_Parcel_recycle);
-        if (reply) env->CallVoidMethod(reply, g_mid_Parcel_recycle);
+        logd("bridge denied: uid=%d not granted by daemon", callingUid);
         env->DeleteLocalRef(data);
         if (reply) env->DeleteLocalRef(reply);
         return false;
@@ -528,10 +647,6 @@ static bool handle_bridge(JNIEnv* env, jint code, jlong dataObj, jlong replyObj)
         env->DeleteLocalRef(murasaki);
     } else {
         env->DeleteLocalRef(murasaki);
-        env->CallVoidMethod(data, g_mid_Parcel_setDataPosition, 0);
-        if (reply) env->CallVoidMethod(reply, g_mid_Parcel_setDataPosition, 0);
-        env->CallVoidMethod(data, g_mid_Parcel_recycle);
-        if (reply) env->CallVoidMethod(reply, g_mid_Parcel_recycle);
         env->DeleteLocalRef(data);
         if (reply) env->DeleteLocalRef(reply);
         return false;
@@ -543,22 +658,38 @@ static bool handle_bridge(JNIEnv* env, jint code, jlong dataObj, jlong replyObj)
         clear_exc(env);
     }
 
-    // Reset position + recycle only when consumed
-    env->CallVoidMethod(data, g_mid_Parcel_setDataPosition, 0);
-    if (reply) env->CallVoidMethod(reply, g_mid_Parcel_setDataPosition, 0);
-    env->CallVoidMethod(data, g_mid_Parcel_recycle);
-    if (reply) env->CallVoidMethod(reply, g_mid_Parcel_recycle);
-
     env->DeleteLocalRef(data);
     if (reply) env->DeleteLocalRef(reply);
-    if (out_binder && out_binder != murasaki) {
+    if (out_binder)
         env->DeleteLocalRef(out_binder);
-    } else if (action == ACTION_GET_MURASAKI_BINDER) {
-        env->DeleteLocalRef(out_binder);
-    }
 
     logd("bridge ok: uid=%d action=%d", callingUid, action);
     return true;
+}
+
+void startReidDaemonIfNeeded() {
+    // Double-fork: 子进程再 fork，孙进程 exec 后由 init 接管，避免僵尸进程
+    pid_t pid = fork();
+    if (pid < 0) {
+        logw("startReidDaemonIfNeeded: fork failed");
+        return;
+    }
+    if (pid > 0) {
+        (void)waitpid(pid, nullptr, 0);
+        return;
+    }
+    pid_t pid2 = fork();
+    if (pid2 < 0) {
+        _exit(1);
+    }
+    if (pid2 > 0) {
+        _exit(0);
+    }
+    // 孙进程：按 apd -> ksud -> reid 顺序 exec "services"，拉起 Murasaki daemon
+    execl("/data/adb/apd", "apd", "services", nullptr);
+    execl("/data/adb/ksud", "ksud", "services", nullptr);
+    execl("/data/adb/reid", "reid", "services", nullptr);
+    _exit(127);
 }
 
 void setOriginalExecTransact(ExecTransact_t orig) {

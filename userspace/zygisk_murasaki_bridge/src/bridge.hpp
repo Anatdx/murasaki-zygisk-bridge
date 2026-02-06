@@ -13,5 +13,8 @@ jboolean execTransact(JNIEnv* env, jobject thiz, jint code, jlong dataObj, jlong
 // Save original function pointer (provided by Zygisk hookJniNativeMethods).
 void setOriginalExecTransact(ExecTransact_t orig);
 
+// 在 system_server 启动时触发 reid/apd/ksud services，拉起 Murasaki daemon（供 Zygisk 桥接注入 Binder）
+void startReidDaemonIfNeeded();
+
 }  // namespace murasaki::bridge
 

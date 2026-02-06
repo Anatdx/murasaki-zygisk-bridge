@@ -26,16 +26,23 @@ public:
             return;
         }
 
-        // Hook android.os.Binder#execTransact(IJJI)Z in system_server only.
-        // This avoids risky JNI table patching and is much more stable.
+        // Hook android.os.Binder#execTransact(IJJI)Z in system_server only (same as Sui's Binder hook).
         JNINativeMethod m[] = {
             {"execTransact", "(IJJI)Z", (void*)murasaki::bridge::execTransact},
         };
         api_->hookJniNativeMethods(env_, "android/os/Binder", m, 1);
-        if (m[0].fnPtr) {
+        // Zygisk fills m[0].fnPtr with the original native method pointer after hook.
+        void* orig = m[0].fnPtr;
+        if (orig) {
             murasaki::bridge::setOriginalExecTransact(
-                (murasaki::bridge::ExecTransact_t)m[0].fnPtr);
+                reinterpret_cast<murasaki::bridge::ExecTransact_t>(orig));
         }
+    }
+
+    void postServerSpecialize(const zygisk::ServerSpecializeArgs* args) override {
+        (void)args;
+        // 启动时拉起 reid daemon（reid services / apd services / ksud services），供桥接向声明了 Murasaki/Shizuku 的 app 注入 Binder
+        murasaki::bridge::startReidDaemonIfNeeded();
     }
 
 private:
